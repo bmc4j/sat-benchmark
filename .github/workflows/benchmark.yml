@@ -131,7 +131,10 @@ jobs:
 
           START=$(date +%s.%N)
           set +e
-          ./gradlew :proofs:test --no-daemon --console=plain $SAT_ARG 2>&1 | tee /tmp/gradle.log
+          # -Dbmc.timeoutSeconds caps a single proof: a mis-tuned (too-hard) problem fails fast
+          # (~5 min) instead of grinding to the 45-min job cap. A well-tuned medium proof finishes
+          # well under it; a solver that can't make it shows up as a clean UNKNOWN, not a hang.
+          ./gradlew :proofs:test --no-daemon --console=plain -Dbmc.timeoutSeconds=300 $SAT_ARG 2>&1 | tee /tmp/gradle.log
           STATUS=${PIPESTATUS[0]}
           set -e
           END=$(date +%s.%N)
