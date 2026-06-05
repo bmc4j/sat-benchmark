@@ -115,7 +115,18 @@ jobs:
             SAT_ARG=""
           else
             chmod +x solver-bin/solver
-            SAT_ARG="-PsatPath=$(pwd)/solver-bin/solver"
+            # Proof-of-engagement: point jbmc at a WRAPPER that records each call before exec'ing the
+            # real solver. If jbmc ever silently fell back to its built-in MiniSat (e.g. string
+            # refinement kicked in), the wrapper is never called and /tmp/solver-invoked.log stays
+            # empty -> the run is failed below. `exec` preserves the solver's stdout (s/v lines) and
+            # exit code, so jbmc parses the result untouched. printf (not a heredoc) keeps the
+            # shebang at column 0.
+            REAL="$(pwd)/solver-bin/solver"
+            WRAP="$(pwd)/solver-bin/wrap"
+            : > /tmp/solver-invoked.log
+            printf '#!/usr/bin/env bash\necho "INVOKED $(date +%%s.%%N) $*" >> /tmp/solver-invoked.log\nexec "%s" "$@"\n' "$REAL" > "$WRAP"
+            chmod +x "$WRAP"
+            SAT_ARG="-PsatPath=$WRAP"
           fi
 
           START=$(date +%s.%N)
@@ -135,10 +146,27 @@ jobs:
             VERDICT=FAILED
           fi
 
+          # Proof-of-engagement: confirm jbmc actually invoked the external solver (no silent
+          # MiniSat fallback). The control uses the built-in solver by design.
+          if [ "$SOLVER" = "control-minisat" ]; then
+            ENGAGED="control (jbmc built-in MiniSat 2.2.1; no --external-sat-solver)"
+          else
+            CALLS=$(grep -c '^INVOKED' /tmp/solver-invoked.log 2>/dev/null || true)
+            CALLS=${CALLS:-0}
+            if [ "$CALLS" -ge 1 ]; then
+              ENGAGED="yes ($CALLS external-solver invocation(s))"
+            else
+              ENGAGED="NO - external solver never called; jbmc fell back to built-in. Result INVALID."
+              echo "::error::$SOLVER: jbmc did NOT invoke the external solver (silent fallback) - failing the job"
+              STATUS=1; VERDICT=FAILED
+            fi
+          fi
+
           {
             echo "solver=$SOLVER"
             echo "seconds=$ELAPSED"
             echo "verdict=$VERDICT"
+            echo "engaged=$ENGAGED"
             echo "bmc=$BMC_LINE"
           } > "result-$SOLVER.txt"
           cat "result-$SOLVER.txt"
@@ -218,12 +246,13 @@ jobs:
                        "`--external-sat-solver` hook. `control-minisat` is jbmc's built-in MiniSat 2.2.1 "
                        "(no external solver).")
           lines.append("")
-          lines.append("| Solver | Wall-clock (s) | Verdict | Speedup vs MiniSat |")
-          lines.append("|---|---:|---|---:|")
+          lines.append("| Solver | Wall-clock (s) | Verdict | Speedup vs MiniSat | External solver engaged |")
+          lines.append("|---|---:|---|---:|---|")
           for r in rows:
               name = r.get("solver", "?")
               secs = r.get("seconds", "?")
               verdict = r.get("verdict", "?")
+              engaged = r.get("engaged", "?")
               label = "**control-minisat**" if name == "control-minisat" else name
               speedup = "—"
               if ctrl_secs and verdict == "VERIFIED":
@@ -233,11 +262,16 @@ jobs:
                           speedup = f"{ctrl_secs / s:.2f}×"
                   except ValueError:
                       pass
-              lines.append(f"| {label} | {secs} | {verdict} | {speedup} |")
+              lines.append(f"| {label} | {secs} | {verdict} | {speedup} | {engaged} |")
           lines.append("")
           lines.append("> Speedup > 1.00× means faster than the built-in MiniSat control. "
                        "Times include jbmc startup + bit-blasting (a fixed ~3-4s for all jobs), so the "
                        "_difference_ between rows is the SAT-solve delta.")
+          lines.append(">")
+          lines.append("> **External solver engaged** is proof, per job, that jbmc actually shelled out to "
+                       "the external solver (via a logging wrapper on `--external-sat-solver`) rather than "
+                       "silently falling back to built-in MiniSat — a job with no invocations is failed, not "
+                       "reported.")
           lines.append("")
 
           table = "\n".join(lines)
