@@ -1,0 +1,262 @@
+name: SAT solver benchmark
+
+# Benchmarks external SAT solvers behind bmc4j's --external-sat-solver hook: one ISOLATED job
+# per solver, each builds/installs only its own solver, runs the single SAT-dominated proof once,
+# and records the wall-clock. A final summary job collects the timings into a comparison table.
+#
+# GitHub Actions is free on this public repo, so running the full matrix on every push is fine.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the summary job commits RESULTS.md
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: ${{ matrix.solver }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - solver: control-minisat   # jbmc built-in MiniSat 2.2.1 — the control (no --external-sat-solver)
+          - solver: kissat
+          - solver: cadical
+          - solver: cryptominisat
+          - solver: glucose
+    steps:
+      - name: Checkout (with bmc4j submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 21 (Foojay provisions the JDK 25 toolchain at build time)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache built SAT solver
+        if: matrix.solver != 'control-minisat'
+        id: solver-cache
+        uses: actions/cache@v4
+        with:
+          path: solver-bin
+          key: solver-${{ matrix.solver }}-v3
+
+      - name: Build / install the SAT solver
+        if: matrix.solver != 'control-minisat' && steps.solver-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p solver-bin
+          sudo apt-get update
+          case "${{ matrix.solver }}" in
+            kissat)
+              sudo apt-get install -y build-essential git
+              git clone --depth 1 https://github.com/arminbiere/kissat.git
+              cd kissat
+              ./configure && make -j"$(nproc)"
+              cp build/kissat ../solver-bin/solver
+              ;;
+            cadical)
+              sudo apt-get install -y build-essential git
+              git clone --depth 1 https://github.com/arminbiere/cadical.git
+              cd cadical
+              ./configure && make -j"$(nproc)"
+              cp build/cadical ../solver-bin/solver
+              ;;
+            cryptominisat)
+              # Released static binary avoids a heavy cmake/boost build.
+              sudo apt-get install -y build-essential cmake libgmp-dev zlib1g-dev git
+              git clone --depth 1 https://github.com/msoos/cryptominisat.git
+              cd cryptominisat
+              mkdir build && cd build
+              cmake -DSTATICCOMPILE=ON -DONLY_SIMPLE=ON .. && make -j"$(nproc)"
+              cp cryptominisat5 ../../solver-bin/solver
+              ;;
+            glucose)
+              sudo apt-get install -y build-essential git zlib1g-dev
+              git clone --depth 1 https://github.com/audemard/glucose.git
+              cd glucose/simp
+              # Glucose's makefile links libz; build the standard (non-parallel) simp solver.
+              make -j"$(nproc)" r
+              cp glucose_release ../../solver-bin/solver
+              ;;
+          esac
+          chmod +x ../solver-bin/solver || chmod +x solver-bin/solver || true
+
+      - name: Verify solver binary (competition DIMACS interface)
+        if: matrix.solver != 'control-minisat'
+        run: |
+          set -euxo pipefail
+          ls -la solver-bin
+          chmod +x solver-bin/solver
+          # Tiny SAT instance: (x1) AND (-x1 OR x2) -> SAT. Confirm the binary prints s SATISFIABLE.
+          printf 'p cnf 2 2\n1 0\n-1 2 0\n' > /tmp/t.cnf
+          # Most of these exit non-zero on SAT (10) / UNSAT (20); don't let that fail the step.
+          solver-bin/solver /tmp/t.cnf > /tmp/out.txt 2>&1 || true
+          cat /tmp/out.txt
+          grep -q 's SATISFIABLE' /tmp/out.txt
+
+      - name: Run the proof and time the solve
+        id: run
+        run: |
+          set -uxo pipefail
+          SOLVER="${{ matrix.solver }}"
+          if [ "$SOLVER" = "control-minisat" ]; then
+            SAT_ARG=""
+          else
+            chmod +x solver-bin/solver
+            SAT_ARG="-PsatPath=$(pwd)/solver-bin/solver"
+          fi
+
+          START=$(date +%s.%N)
+          set +e
+          ./gradlew :proofs:test --no-daemon --console=plain $SAT_ARG 2>&1 | tee /tmp/gradle.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          END=$(date +%s.%N)
+
+          ELAPSED=$(awk "BEGIN{printf \"%.1f\", $END - $START}")
+          # bmc4j's own per-proof wall time, e.g. "bmc4j < OK  ... (12.3s)".
+          BMC_LINE=$(grep -E 'bmc4j < ' /tmp/gradle.log | head -1 || true)
+
+          if [ "$STATUS" -eq 0 ]; then
+            VERDICT=VERIFIED
+          else
+            VERDICT=FAILED
+          fi
+
+          {
+            echo "solver=$SOLVER"
+            echo "seconds=$ELAPSED"
+            echo "verdict=$VERDICT"
+            echo "bmc=$BMC_LINE"
+          } > "result-$SOLVER.txt"
+          cat "result-$SOLVER.txt"
+
+          # Surface failure, but still upload the artifact (always() below).
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::warning::$SOLVER run did not VERIFY (exit $STATUS)"
+            exit "$STATUS"
+          fi
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.solver }}
+          path: result-${{ matrix.solver }}.txt
+          if-no-files-found: warn
+
+  summary:
+    name: summary
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Build comparison table
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import glob, os, datetime
+
+          rows = []
+          for f in sorted(glob.glob("results/result-*.txt")):
+              d = {}
+              for line in open(f):
+                  line = line.strip()
+                  if "=" in line:
+                      k, v = line.split("=", 1)
+                      d[k] = v
+              rows.append(d)
+
+          control = next((r for r in rows if r.get("solver") == "control-minisat"), None)
+          ctrl_secs = None
+          if control and control.get("verdict") == "VERIFIED":
+              try:
+                  ctrl_secs = float(control["seconds"])
+              except (ValueError, KeyError):
+                  ctrl_secs = None
+
+          def sortkey(r):
+              try:
+                  return (0, float(r.get("seconds", "inf")))
+              except ValueError:
+                  return (1, float("inf"))
+          rows.sort(key=sortkey)
+
+          lines = []
+          lines.append("# SAT solver benchmark results")
+          lines.append("")
+          lines.append(f"_Run: [{os.environ.get('GITHUB_RUN_ID','local')}]"
+                       f"(https://github.com/{os.environ.get('GITHUB_REPOSITORY','bmc4j/sat-benchmark')}"
+                       f"/actions/runs/{os.environ.get('GITHUB_RUN_ID','')})"
+                       f" — {datetime.datetime.utcnow().isoformat(timespec='seconds')}Z_")
+          lines.append("")
+          lines.append("One string-free, SAT-dominated `@BmcProof` (the Euclidean division identity over "
+                       "wide symbolic operands) run once per solver behind bmc4j's "
+                       "`--external-sat-solver` hook. `control-minisat` is jbmc's built-in MiniSat 2.2.1 "
+                       "(no external solver).")
+          lines.append("")
+          lines.append("| Solver | Wall-clock (s) | Verdict | Speedup vs MiniSat |")
+          lines.append("|---|---:|---|---:|")
+          for r in rows:
+              name = r.get("solver", "?")
+              secs = r.get("seconds", "?")
+              verdict = r.get("verdict", "?")
+              label = "**control-minisat**" if name == "control-minisat" else name
+              speedup = "—"
+              if ctrl_secs and verdict == "VERIFIED":
+                  try:
+                      s = float(secs)
+                      if s > 0:
+                          speedup = f"{ctrl_secs / s:.2f}×"
+                  except ValueError:
+                      pass
+              lines.append(f"| {label} | {secs} | {verdict} | {speedup} |")
+          lines.append("")
+          lines.append("> Speedup > 1.00× means faster than the built-in MiniSat control. "
+                       "Times include jbmc startup + bit-blasting (a fixed ~3-4s for all jobs), so the "
+                       "_difference_ between rows is the SAT-solve delta.")
+          lines.append("")
+
+          table = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(table + "\n")
+          with open("RESULTS.md", "w") as fh:
+              fh.write(table + "\n")
+          print(table)
+          PY
+
+      - name: Commit RESULTS.md
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q RESULTS.md; then
+            git add RESULTS.md
+            git commit -m "ci: update benchmark RESULTS.md [skip ci]"
+            git push
+          else
+            echo "RESULTS.md unchanged."
+          fi

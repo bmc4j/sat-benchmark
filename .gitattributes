@@ -1,0 +1,10 @@
+# Authored on Windows; CI runs on Linux. Keep shell scripts, the Gradle wrapper, and YAML LF
+# so bash shebangs and YAML parse correctly on ubuntu-latest runners.
+* text=auto eol=lf
+gradlew text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+gradlew.bat text eol=crlf
+*.bat text eol=crlf
+*.jar binary

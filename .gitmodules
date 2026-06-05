@@ -1,0 +1,3 @@
+[submodule "bmc4j"]
+	path = bmc4j
+	url = https://github.com/bmc4j/bmc4j.git
