@@ -23,6 +23,10 @@ jobs:
     name: ${{ matrix.solver }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # A solver that legitimately can't solve the proof within the timeout (e.g. glucose, which
+    # thrashes on this division-heavy instance) is a real benchmark result, not a CI breakage —
+    # allow_failure lets that job report its UNKNOWN/timeout without failing the whole run.
+    continue-on-error: ${{ matrix.allow_failure || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +36,7 @@ jobs:
           - solver: cadical
           - solver: cryptominisat
           - solver: glucose
+            allow_failure: true        # timed out (>600s) on the division proof — slower than MiniSat
     steps:
       - name: Checkout (with bmc4j submodule)
         uses: actions/checkout@v4
@@ -244,10 +249,11 @@ jobs:
                        f"/actions/runs/{os.environ.get('GITHUB_RUN_ID','')})"
                        f" — {datetime.datetime.utcnow().isoformat(timespec='seconds')}Z_")
           lines.append("")
-          lines.append("One string-free, SAT-dominated `@BmcProof` (the Euclidean division identity over "
-                       "wide symbolic operands) run once per solver behind bmc4j's "
-                       "`--external-sat-solver` hook. `control-minisat` is jbmc's built-in MiniSat 2.2.1 "
-                       "(no external solver).")
+          lines.append("One string-free, SAT-dominated `@BmcProof` — bmc4j's own "
+                       "`BigDecimalLaws.setScale_widen_then_narrow_round_trips` at wide bound "
+                       "(division-heavy via the model's `roundDiv` rounding-divider) — run once per "
+                       "solver behind bmc4j's `--external-sat-solver` hook. `control-minisat` is jbmc's "
+                       "built-in MiniSat 2.2.1 (no external solver).")
           lines.append("")
           lines.append("| Solver | Wall-clock (s) | Verdict | Speedup vs MiniSat | External solver engaged |")
           lines.append("|---|---:|---|---:|---|")
